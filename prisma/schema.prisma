@@ -1,0 +1,154 @@
+// iPhone 18 Pro Max Stock Bot - Advice (www.advice.co.th)
+// Catalogue + availability source: the Nuxt SSR payload (__NUXT_DATA__)
+// embedded in the group product page - one request covers every variant.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Observed availability. UNKNOWN is used whenever Advice could not be reached
+/// or returned a shape we do not understand. UNKNOWN is NEVER treated as
+/// UNAVAILABLE - that would produce false "back in stock" alerts.
+enum StockStatus {
+  AVAILABLE
+  UNAVAILABLE
+  UNKNOWN
+}
+
+model Product {
+  id        String           @id @default(uuid())
+  model     String           @unique /// e.g. "iPhone 18 Pro Max"
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  variants  ProductVariant[]
+
+  @@map("products")
+}
+
+model ProductVariant {
+  id        String @id @default(uuid())
+  productId String @map("product_id")
+  /// Advice item code, e.g. "A0186084" - the variant identifier
+  sku       String @unique
+  color     String /// canonical English name, e.g. "Burgundy"
+  colorTh   String? @map("color_th") /// Thai display name, e.g. "เบอร์กันดี"
+  /// Colour slug, e.g. "burgundy"
+  colorKey  String? @map("color_key")
+  colorCode String? @map("color_code") /// hex swatch, e.g. "#4D1821"
+  storage   String /// e.g. "256GB"
+  /// Deep link straight to this colour+capacity on the PDP.
+  url       String?
+  priceTHB  Decimal? @map("price_thb") @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  stocks  Stock[]
+
+  @@unique([productId, color, storage])
+  @@index([productId])
+  @@map("product_variants")
+}
+
+/// A selling channel. Today only Advice Online ("ONLINE"); the schema keeps
+/// the dimension so per-branch stock can be added later without a migration.
+model Store {
+  id        String   @id @default(uuid())
+  /// Channel code, e.g. "ONLINE"
+  code      String   @unique
+  name      String /// e.g. "Advice Online"
+  rawName   String?  @map("raw_name") /// exactly as Advice identifies it
+  city      String?
+  province  String?
+  address   String?
+  country   String   @default("TH")
+  latitude  Float?
+  longitude Float?
+  storeUrl  String?  @map("store_url")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stocks Stock[]
+
+  @@map("stores")
+}
+
+model Stock {
+  id        String @id @default(uuid())
+  variantId String @map("variant_id")
+  storeId   String @map("store_id")
+
+  /// Last DEFINITIVE answer from Advice. Not touched by UNKNOWN checks,
+  /// which is what makes the bot restart- and outage-safe.
+  available Boolean @default(false)
+  /// Last DEFINITIVE sellable count. Like `available`, UNKNOWN never blanks it.
+  quantity  Int?
+  /// Last OBSERVED status, including UNKNOWN.
+  status    StockStatus @default(UNKNOWN)
+
+  lastCheckedAt   DateTime? @map("last_checked_at")
+  lastAvailableAt DateTime? @map("last_available_at")
+  /// Set on the very first observation so first-run never notifies.
+  firstSeenAt     DateTime  @default(now()) @map("first_seen_at")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  variant           ProductVariant    @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  store             Store             @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  history           StockHistory[]
+  notificationLogs  NotificationLog[]
+
+  @@unique([variantId, storeId])
+  @@index([available])
+  @@index([storeId])
+  @@map("stocks")
+}
+
+/// One row per OBSERVED CHANGE (not one row per check) to keep the table small.
+model StockHistory {
+  id        String      @id @default(uuid())
+  stockId   String      @map("stock_id")
+  available Boolean?
+  quantity  Int?
+  status    StockStatus
+  checkedAt DateTime    @default(now()) @map("checked_at")
+
+  stock Stock @relation(fields: [stockId], references: [id], onDelete: Cascade)
+
+  @@index([stockId, checkedAt])
+  @@map("stock_history")
+}
+
+model NotificationLog {
+  id             String      @id @default(uuid())
+  stockId        String      @map("stock_id")
+  previousStatus StockStatus @map("previous_status")
+  currentStatus  StockStatus @map("current_status")
+  sentAt         DateTime    @default(now()) @map("sent_at")
+  messageId      String?     @map("message_id")
+  success        Boolean     @default(true)
+  error          String?
+
+  stock Stock @relation(fields: [stockId], references: [id], onDelete: Cascade)
+
+  @@index([stockId, sentAt])
+  @@map("notification_logs")
+}
+
+/// Cooperative lock so multiple bot instances never run a check concurrently.
+model JobLock {
+  name       String   @id
+  owner      String
+  lockedAt   DateTime @default(now()) @map("locked_at")
+  expiresAt  DateTime @map("expires_at")
+
+  @@map("job_locks")
+}
